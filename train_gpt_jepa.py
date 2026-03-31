@@ -96,6 +96,7 @@ class Hyperparameters:
     # Latent prediction (JEPA).
     jepa_loss_weight = float(os.environ.get("JEPA_LOSS_WEIGHT", "0.5"))
     jepa_bottleneck = int(os.environ.get("JEPA_BOTTLENECK", "128"))
+    jepa_horizons = int(os.environ.get("JEPA_HORIZONS", "3"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -684,6 +685,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         jepa_bottleneck: int = 128,
+        jepa_horizons: int = 3,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -714,6 +716,8 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self.latent_predictor = LatentPredictor(model_dim, jepa_bottleneck)
+        self.num_horizons = jepa_horizons
+        self.error_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self) -> None:
