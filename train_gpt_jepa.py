@@ -739,6 +739,34 @@ class GPT(nn.Module):
 
         encoder_out = x
 
+        # Multi-horizon latent rollout: apply predictor recursively like a
+        # learned dynamics model, predicting t+1, t+2, ... t+K in latent space.
+        horizon_preds: list[Tensor] = []
+        h = encoder_out
+        for _ in range(self.num_horizons):
+            h = self.latent_predictor(h)
+            horizon_preds.append(h)
+
+        # Prediction errors at each horizon form a multi-scale "surprise" signal.
+        # Positions where the world model was wrong get large errors, telling the
+        # decoder where to focus. Inspired by predictive coding (Rao & Ballard 1999).
+        jepa_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        error_combined = torch.zeros_like(encoder_out)
+        w = 1.0
+        for k, pred in enumerate(horizon_preds):
+            offset = k + 1
+            tgt = encoder_out[:, offset:, :].detach()
+            pred_n = F.normalize(pred.float(), dim=-1)
+            tgt_n = F.normalize(tgt.float(), dim=-1)
+            jepa_loss = jepa_loss + w * F.smooth_l1_loss(pred_n, tgt_n)
+            error = (pred_n - tgt_n).to(dtype=encoder_out.dtype)
+            error_combined[:, offset:, :] = error_combined[:, offset:, :] + w * error
+            w = w * 0.5
+
+        # Inject the error signal into the decoder path.
+        gate = self.error_gate.to(dtype=x.dtype)[None, None, :]
+        x = x + gate * error_combined
+
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -755,12 +783,6 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
-        pred = self.latent_predictor(encoder_out)
-        target = encoder_out[:, 1:, :].detach()
-        jepa_loss = F.smooth_l1_loss(
-            F.normalize(pred.float(), dim=-1),
-            F.normalize(target.float(), dim=-1),
-        )
         return ce_loss, jepa_loss
 
 
