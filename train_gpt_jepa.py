@@ -2,10 +2,10 @@
 JEPA-LM: Latent Predictive World Model for Parameter Golf
 
 Extends the baseline transformer with a JEPA-style latent prediction objective
-at the encoder-decoder boundary. A lightweight bottleneck predictor learns forward
-dynamics in representation space. The auxiliary smooth-L1 loss provides additional
-gradient signal during training, improving parameter efficiency. The predictor is
-stripped before serialization, adding zero bytes to the final artifact.
+at the encoder-decoder boundary. A lightweight bottleneck predictor is applied
+recursively to predict multiple future representations in latent space (like a
+learned dynamics model). Prediction errors form a multi-scale "surprise" signal
+injected into the decoder, inspired by predictive coding (Rao & Ballard 1999).
 
 Based on: NextLat (Srivastava et al., ICLR 2026), I-JEPA (Assran et al., 2023),
 data2vec (Baevski et al., 2022).
