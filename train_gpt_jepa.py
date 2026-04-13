@@ -26,6 +26,27 @@ import uuid
 import zlib
 from pathlib import Path
 
+try:
+    import zstandard as zstd
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
+
+
+def _compress_blob(raw: bytes) -> bytes:
+    if _HAS_ZSTD:
+        return zstd.ZstdCompressor(level=22).compress(raw)
+    return zlib.compress(raw, level=9)
+
+
+def _decompress_blob(blob: bytes) -> bytes:
+    if _HAS_ZSTD:
+        try:
+            return zstd.ZstdDecompressor().decompress(blob)
+        except zstd.ZstdError:
+            return zlib.decompress(blob)
+    return zlib.decompress(blob)
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -1151,8 +1172,9 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = _compress_blob(quant_raw)
     quant_raw_bytes = len(quant_raw)
+    compression_kind = "zstd" if _HAS_ZSTD else "zlib"
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1160,16 +1182,16 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int8+{compression_kind}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+{compression_kind}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(_decompress_blob(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
