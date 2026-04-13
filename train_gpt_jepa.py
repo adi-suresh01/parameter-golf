@@ -748,14 +748,16 @@ class GPT(nn.Module):
 
         # Multi-horizon JEPA loss: the predictor learns a dynamics model in
         # latent space. The auxiliary loss shapes encoder representations to be
-        # temporally predictable, improving parameter efficiency.
+        # temporally predictable, improving parameter efficiency. Layer norm on
+        # both sides matches the data2vec approach and is numerically stable.
         jepa_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        feat_dim = encoder_out.size(-1)
         w = 1.0
         for k, pred in enumerate(horizon_preds):
             offset = k + 1
             tgt = encoder_out[:, offset:, :].detach()
-            pred_n = F.normalize(pred.float(), dim=-1)
-            tgt_n = F.normalize(tgt.float(), dim=-1)
+            pred_n = F.layer_norm(pred.float(), (feat_dim,))
+            tgt_n = F.layer_norm(tgt.float(), (feat_dim,))
             jepa_loss = jepa_loss + w * F.smooth_l1_loss(pred_n, tgt_n)
             w = w * 0.5
 
