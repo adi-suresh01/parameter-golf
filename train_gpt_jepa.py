@@ -187,6 +187,14 @@ class Hyperparameters:
     bigram_num_buckets = int(os.environ.get("BIGRAM_NUM_BUCKETS", "0"))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", "32"))
 
+    # EMA weight averaging: maintain an exponential moving average of the model
+    # weights during training and save the EMA weights as the final artifact
+    # instead of the instantaneous ones. EMA smooths the noise from late-stage
+    # updates and produces a better-generalizing final model. Zero artifact cost
+    # (same parameter count, just averaged values). EMA_DECAY > 0 enables it.
+    ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))
+    ema_warmup_steps = int(os.environ.get("EMA_WARMUP_STEPS", "500"))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1326,6 +1334,49 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class EMAShadow:
+    """Maintains an exponential moving average of a model's parameters.
+
+    Update every optimizer step: ema = decay * ema + (1 - decay) * current.
+    Stored in fp32 regardless of model dtype for numerical stability. Provides
+    swap/restore helpers so eval can temporarily run with EMA weights without
+    permanently modifying the training state.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow: dict[str, Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.detach().to(dtype=torch.float32).clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is None:
+                continue
+            shadow.mul_(self.decay).add_(param.data.to(dtype=torch.float32), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def swap_in(self, model: nn.Module) -> dict[str, Tensor]:
+        backup: dict[str, Tensor] = {}
+        for name, param in model.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is None:
+                continue
+            backup[name] = param.data.clone()
+            param.data.copy_(shadow.to(dtype=param.data.dtype))
+        return backup
+
+    @torch.no_grad()
+    def swap_out(self, model: nn.Module, backup: dict[str, Tensor]) -> None:
+        for name, param in model.named_parameters():
+            saved = backup.get(name)
+            if saved is not None:
+                param.data.copy_(saved)
+
+
 class BigramHashEmbedding(nn.Module):
     """Learnable lookup table indexed by hash(prev_token, curr_token).
 
@@ -1891,6 +1942,10 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
+    # EMA shadow parameters (only if EMA_DECAY > 0). Initialized after warmup
+    # so the shadow reflects meaningful weights rather than tuning noise.
+    ema_shadow: EMAShadow | None = None
+
     # MAIN TRAINING LOOP
     # -----------------------------
 
@@ -1966,6 +2021,12 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        if args.ema_decay > 0:
+            if ema_shadow is None and step + 1 >= args.ema_warmup_steps:
+                ema_shadow = EMAShadow(base_model, args.ema_decay)
+            elif ema_shadow is not None:
+                ema_shadow.update(base_model)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1997,6 +2058,13 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    # Swap in EMA weights for serialization and all subsequent evals. The
+    # instantaneous weights are discarded once we reach this point since we
+    # are past the training loop.
+    if ema_shadow is not None:
+        ema_shadow.swap_in(base_model)
+        log0(f"ema:swapped_in decay={args.ema_decay} warmup={args.ema_warmup_steps}")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
