@@ -558,13 +558,14 @@ def eval_val_imagination(
     imagine_lambda: float,
     imagine_horizons: int,
 ) -> tuple[float, float]:
-    # Imagination-Refined Prediction: at each eval position t, compute both the
-    # standard logits head(hidden[t]) and the imagined logits obtained by
-    # running the JEPA predictor on hidden[t-1] and decoding through the same
-    # head. Mix in probability space via logaddexp. This is a form of learned
-    # self-consistency only possible for JEPA-style models that carry a
-    # trained latent-dynamics predictor. No extra training; the predictor
-    # already exists from training.
+    # Imagination-Refined Prediction. The JEPA predictor was trained to predict
+    # the next position's encoder_out (mid-network hidden state), so we apply it
+    # there, then run the decoder + head on the predicted encoder_out to get
+    # imagined logits. Actual encoder skip activations from the real sequence
+    # are reused (sliced to align with the shifted positions) so the decoder
+    # still gets proper context. Mix in probability space via logaddexp with
+    # horizon-decayed weights. Only JEPA-style models can do this since we need
+    # a trained latent-dynamics predictor.
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
@@ -574,9 +575,6 @@ def eval_val_imagination(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    log_one_minus_lambda = math.log(max(1.0 - imagine_lambda, 1e-10))
-    log_lambda = math.log(max(imagine_lambda, 1e-10))
 
     base_model.eval()
     with torch.no_grad():
@@ -589,30 +587,36 @@ def eval_val_imagination(
             y = local[1:].reshape(-1, args.train_seq_len)
             bsz, seqlen = x.shape
 
+            # Standard path: full encoder+decoder, get standard logits.
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                hidden = base_model.encode(x)
-            standard_logits = base_model.head(hidden).reshape(bsz, seqlen, -1).float()
+                encoder_out, skips, x0 = base_model.encode_stages(x)
+                standard_hidden = base_model.decode_from(encoder_out, skips, x0)
+            standard_logits = base_model.head(standard_hidden).reshape(bsz, seqlen, -1).float()
             standard_logprobs = F.log_softmax(standard_logits, dim=-1)
 
-            # Multi-horizon imagination: apply predictor H times, each time
-            # decoding the prediction back to logits. Horizon h predicts
-            # positions h+1..T-1 using positions 0..T-2-h as seeds.
+            # Imagined path: apply predictor recursively to encoder_out, then
+            # run decoder on each horizon's predicted encoder_out with
+            # position-aligned skip slices.
             mixed_logprobs = standard_logprobs.clone()
-            h = hidden
+            predicted_encoder = encoder_out
             for horizon in range(imagine_horizons):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    h = base_model.latent_predictor(h)
+                    predicted_encoder = base_model.latent_predictor(predicted_encoder)
                 offset = horizon + 1
-                # h has shape [B, T - offset, D]; it predicts positions
-                # offset..T-1. Decode to logits.
-                imagined_logits = base_model.head(h).reshape(bsz, seqlen - offset, -1).float()
+                # predicted_encoder has shape [B, T - offset, D]; it predicts
+                # encoder_out at positions offset..T-1. Align the skips to
+                # those positions.
+                skips_sliced = [s[:, offset:, :] for s in skips]
+                x0_sliced = x0[:, offset:, :]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    imagined_hidden = base_model.decode_from(predicted_encoder, skips_sliced, x0_sliced)
+                imagined_logits = base_model.head(imagined_hidden).reshape(bsz, seqlen - offset, -1).float()
                 imagined_logprobs = F.log_softmax(imagined_logits, dim=-1)
-                # Horizon weight decays so nearer horizons dominate.
+
                 horizon_w = 1.0 / (2 ** horizon)
                 horizon_lambda = imagine_lambda * horizon_w
                 h_log_one_minus = math.log(max(1.0 - horizon_lambda, 1e-10))
                 h_log_lambda = math.log(max(horizon_lambda, 1e-10))
-                # Mix only the positions this horizon can predict.
                 target_slice = mixed_logprobs[:, offset:, :]
                 mixed_logprobs[:, offset:, :] = torch.logaddexp(
                     target_slice + h_log_one_minus,
@@ -1241,8 +1245,7 @@ class GPT(nn.Module):
 
     def encode(self, input_ids: Tensor) -> Tensor:
         """Run the full encoder-decoder stack and return the pre-LM-head hidden
-        state. Used by SLOT (eval-time delta optimization) which only needs the
-        final hidden representation, not the loss.
+        state. Used by SLOT (eval-time delta optimization).
         """
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -1254,6 +1257,33 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def encode_stages(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor], Tensor]:
+        """Run the encoder only. Returns (encoder_out, encoder_skips, x0) so the
+        imagination path can apply the latent predictor to encoder_out (the
+        distribution the predictor was trained on) and then run the decoder on
+        the predicted representation.
+        """
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        return x, skips, x0
+
+    def decode_from(self, encoder_out: Tensor, skips: list[Tensor], x0: Tensor) -> Tensor:
+        """Run the decoder stack and final norm starting from encoder_out and the
+        supplied skip activations. skips is consumed in reverse order (U-Net).
+        """
+        x = encoder_out
+        skips_local = list(skips)
+        for i in range(self.num_decoder_layers):
+            if skips_local:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips_local.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
