@@ -178,6 +178,15 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", "0.9"))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", "1.0"))
 
+    # BigramHash: a learnable lookup table indexed by a hash of
+    # (prev_token, curr_token). The looked-up feature is projected to model_dim
+    # and added to the token embedding as a residual. This gives the model a
+    # direct bigram shortcut beyond what the transformer learns from attention.
+    # Small parameter cost, proven -0.005 to -0.010 BPB on SOTA submissions.
+    # BIGRAM_NUM_BUCKETS > 0 enables it.
+    bigram_num_buckets = int(os.environ.get("BIGRAM_NUM_BUCKETS", "0"))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", "32"))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1317,6 +1326,34 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class BigramHashEmbedding(nn.Module):
+    """Learnable lookup table indexed by hash(prev_token, curr_token).
+
+    Each position retrieves a feature from a shared [num_buckets, hash_dim] table
+    using a simple prime-multiplier hash over the two adjacent input tokens, then
+    projects the feature to model_dim and adds it to the token embedding. The
+    projection is zero-initialized so the module starts as a no-op and gradually
+    learns useful bigram-specific corrections during training.
+    """
+
+    def __init__(self, num_buckets: int, hash_dim: int, model_dim: int, vocab_size: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.vocab_size = vocab_size
+        self.table = nn.Parameter(torch.zeros(num_buckets, hash_dim))
+        nn.init.normal_(self.table, mean=0.0, std=0.02)
+        self.proj = CastedLinear(hash_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        padded = F.pad(input_ids, (1, 0), value=0)
+        prev = padded[:, :-1].long()
+        curr = input_ids.long()
+        bucket = (prev * 7919 + curr * 31) % self.num_buckets
+        flat = self.table[bucket.reshape(-1)]
+        return self.proj(flat).reshape(input_ids.size(0), input_ids.size(1), -1)
+
+
 class LatentPredictor(nn.Module):
     def __init__(self, dim: int, bottleneck: int):
         super().__init__()
@@ -1377,6 +1414,8 @@ class GPT(nn.Module):
         jepa_horizons: int = 3,
         jepa_num_anchors: int = 1,
         imagine_train_horizons: int = 0,
+        bigram_num_buckets: int = 0,
+        bigram_hash_dim: int = 32,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1410,6 +1449,12 @@ class GPT(nn.Module):
         self.num_horizons = jepa_horizons
         self.num_jepa_anchors = max(1, min(jepa_num_anchors, num_layers // 2))
         self.imagine_train_horizons = min(imagine_train_horizons, jepa_horizons)
+        if bigram_num_buckets > 0:
+            self.bigram_hash: nn.Module | None = BigramHashEmbedding(
+                bigram_num_buckets, bigram_hash_dim, model_dim, vocab_size
+            )
+        else:
+            self.bigram_hash = None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1422,6 +1467,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids).to(dtype=x.dtype)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1526,6 +1573,8 @@ class GPT(nn.Module):
         """
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids).to(dtype=x.dtype)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -1545,6 +1594,8 @@ class GPT(nn.Module):
         """
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids).to(dtype=x.dtype)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -1691,6 +1742,8 @@ def main() -> None:
         jepa_horizons=args.jepa_horizons,
         jepa_num_anchors=args.jepa_num_anchors,
         imagine_train_horizons=(args.imagine_train_horizons if args.imagine_train_weight > 0 else 0),
+        bigram_num_buckets=args.bigram_num_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1722,6 +1775,12 @@ def main() -> None:
             matrix_params.append(p)
         else:
             scalar_params.append(p)
+    if base_model.bigram_hash is not None:
+        for name, p in base_model.bigram_hash.named_parameters():
+            if p.ndim == 2:
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
