@@ -166,6 +166,18 @@ class Hyperparameters:
     # compute by roughly seq_len/stride but typically gives -0.01 to -0.03 BPB.
     sliding_stride = int(os.environ.get("SLIDING_STRIDE", "0"))
 
+    # Legal Test-Time Training. For each val chunk: first score under
+    # inference_mode (the BPB-counted pass), then run ttt_epochs SGD steps on
+    # the same chunk's CE loss (the training pass). Updated weights carry
+    # forward to the next chunk. Score-first ordering ensures tokens are graded
+    # before the model learns from them. Proven -0.003 to -0.005 BPB on top
+    # submissions. TTT_LR > 0 enables it.
+    ttt_lr = float(os.environ.get("TTT_LR", "0.0"))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "32768"))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", "0.9"))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", "1.0"))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -553,6 +565,102 @@ def eval_val_sliding(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     base_model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_lr: float,
+    ttt_epochs: int,
+    ttt_chunk_seqs: int,
+    ttt_momentum: float,
+    ttt_grad_clip: float,
+    distributed: bool,
+) -> tuple[float, float]:
+    # Legal score-first Test-Time Training. Each chunk is first scored under
+    # inference_mode (counted toward BPB), then trained on via SGD for a few
+    # epochs. All ranks process the same chunks in lockstep: DDP averages
+    # gradients so each rank's model update matches, and weights stay in sync.
+    # Loss is only accumulated over the scoring pass, so we never grade tokens
+    # with weights that were trained on them.
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    chunk_seqs = max(1, ttt_chunk_seqs)
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Fresh SGD optimizer over all model parameters.
+    ttt_optimizer = torch.optim.SGD(base_model.parameters(), lr=ttt_lr, momentum=ttt_momentum)
+
+    # Build all chunk ranges.
+    chunk_ranges: list[tuple[int, int]] = []
+    seq_idx = 0
+    while seq_idx + chunk_seqs <= total_seqs:
+        raw_start = seq_idx * args.train_seq_len
+        raw_end = (seq_idx + chunk_seqs) * args.train_seq_len + 1
+        chunk_ranges.append((raw_start, raw_end))
+        seq_idx += chunk_seqs
+
+    # Distribute chunks across ranks for scoring. Training always uses the full
+    # chunk (all ranks in DDP so gradients sync). We simplify by having each
+    # rank score its own slice; the loss sums across ranks via all_reduce.
+    n_chunks = len(chunk_ranges)
+    score_start = (n_chunks * rank) // world_size
+    score_end = (n_chunks * (rank + 1)) // world_size
+    my_score_chunks = set(range(score_start, score_end))
+
+    for chunk_idx, (raw_start, raw_end) in enumerate(chunk_ranges):
+        local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+        x = local[:-1].reshape(-1, args.train_seq_len)
+        y = local[1:].reshape(-1, args.train_seq_len)
+
+        # Score pass. Only the rank that owns this chunk accumulates the loss,
+        # so the final sum equals the total val loss. All ranks still run the
+        # forward to keep CUDA streams balanced.
+        base_model.eval()
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            ce_loss, _, _ = model(x, y)
+        if chunk_idx in my_score_chunks:
+            batch_token_count = float(y.numel())
+            val_loss_sum += ce_loss.detach().to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+        # Training pass. All ranks run the same forward/backward so DDP sync
+        # keeps weights identical across ranks.
+        base_model.train()
+        for _ in range(ttt_epochs):
+            ttt_optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                ce_loss, _, _ = model(x, y)
+            ce_loss.backward()
+            if ttt_grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), ttt_grad_clip)
+            ttt_optimizer.step()
+
+    if distributed and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    base_model.eval()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
@@ -1971,6 +2079,40 @@ def main() -> None:
             f"eval_time:{1000.0 * (time.perf_counter() - t_ngram):.0f}ms"
         )
         log0(f"final_ngram_exact val_loss:{ngram_loss:.8f} val_bpb:{ngram_bpb:.8f}")
+
+    if args.ttt_lr > 0:
+        log0(
+            f"ttt:enabled lr={args.ttt_lr} epochs={args.ttt_epochs} "
+            f"chunk_tokens={args.ttt_chunk_tokens} momentum={args.ttt_momentum} "
+            f"grad_clip={args.ttt_grad_clip}"
+        )
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_chunk_seqs = max(1, args.ttt_chunk_tokens // args.train_seq_len)
+        ttt_loss, ttt_bpb = eval_val_ttt(
+            args,
+            model,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            args.ttt_lr,
+            args.ttt_epochs,
+            ttt_chunk_seqs,
+            args.ttt_momentum,
+            args.ttt_grad_clip,
+            distributed,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
 
     if args.slot_lr > 0:
         log0(
